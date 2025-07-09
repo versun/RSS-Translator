@@ -1,6 +1,9 @@
 import logging
 import sys
 import time
+import os
+from concurrent.futures import wait
+
 from django.core.management.base import BaseCommand
 from core.models import Feed
 from core.tasks import (
@@ -28,33 +31,55 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         target_frequency = options["frequency"]
-        if target_frequency:
-            valid_frequencies = [
-                "5 min",
-                "15 min",
-                "30 min",
-                "hourly",
-                "daily",
-                "weekly",
-            ]
-            if target_frequency not in valid_frequencies:
-                self.stderr.write(
-                    f"{current_time}: Error: Invalid frequency. Valid options: {', '.join(valid_frequencies)}"
+        if not target_frequency:
+            self.stderr.write(f"{current_time}: Error: Frequency must be specified.")
+            sys.exit(1)
+
+        valid_frequencies = [
+            "5 min",
+            "15 min",
+            "30 min",
+            "hourly",
+            "daily",
+            "weekly",
+        ]
+        if target_frequency not in valid_frequencies:
+            self.stderr.write(
+                f"{current_time}: Error: Invalid frequency. Valid options: {', '.join(valid_frequencies)}"
+            )
+            sys.exit(1)
+
+        lock_file_path = f"/tmp/update_feeds_{target_frequency.replace(' ', '_')}.lock"
+
+        if os.path.exists(lock_file_path):
+            self.stdout.write(
+                self.style.WARNING(
+                    f"{current_time}: Another update process for frequency '{target_frequency}' is already running. Exiting."
                 )
-                sys.exit(1)
-            try:
-                update_feeds_for_frequency(simple_update_frequency=target_frequency)
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f"{current_time}: Successfully updated feeds for frequency: {target_frequency}"
-                    )
+            )
+            sys.exit(0)
+
+        try:
+            # Create lock file
+            with open(lock_file_path, "w") as f:
+                f.write(str(os.getpid()))
+
+            update_feeds_for_frequency(simple_update_frequency=target_frequency)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"{current_time}: Successfully updated feeds for frequency: {target_frequency}"
                 )
-            except Exception as e:
-                logging.exception(
-                    f"Command update_feeds_for_frequency failed: {str(e)}"
-                )
-                self.stderr.write(self.style.ERROR(f"Error: {str(e)}"))
-                sys.exit(1)
+            )
+        except Exception as e:
+            logging.exception(
+                f"Command update_feeds_for_frequency failed: {str(e)}"
+            )
+            self.stderr.write(self.style.ERROR(f"Error: {str(e)}"))
+            sys.exit(1)
+        finally:
+            # Ensure lock file is removed
+            if os.path.exists(lock_file_path):
+                os.remove(lock_file_path)
 
 
 def update_single_feed(feed: Feed):
@@ -92,35 +117,33 @@ def update_single_feed(feed: Feed):
 
 def update_multiple_feeds(feeds: list):
     """并行更新多个Feed"""
+    if not feeds:
+        logging.info("No feeds to update.")
+        return
     try:
         # 先执行所有feed更新任务
-        task_ids = []
-        for feed in feeds:
-            task_name = f"update_feed_{feed.name}"
-            task_id = task_manager.submit_task(task_name, update_single_feed, feed)
-            task_ids.append(task_id)
+        futures = [
+            task_manager.submit_task(f"update_feed_{feed.name}", update_single_feed, feed)
+            for feed in feeds
+        ]
 
         # 等待所有任务完成（最多30分钟）
-        timeout = 1800  # 30分钟（秒）
-        start_time = time.time()
+        timeout = 1800  # 30分钟（1800秒）
+        done, not_done = wait(futures, timeout=timeout)
 
-        while True:
-            # 检查所有任务状态
-            all_done = True
-            for task_id in task_ids:
-                status_info = task_manager.get_task_status(task_id)
-                if status_info.get("status") in ["pending", "running"]:
-                    all_done = False
-                    break
+        if not_done:
+            logging.warning(
+                f"Feed update task timed out. {len(not_done)} tasks did not complete."
+            )
 
-            # 如果所有任务完成或超时则退出循环
-            if all_done or (time.time() - start_time > timeout):
-                break
-
-            # 等待1秒后再次检查
-            time.sleep(3)
+        for future in done:
+            try:
+                future.result()
+            except Exception as e:
+                logging.warning(f"A feed update task resulted in an exception: {e}")
 
         # 所有任务完成后执行缓存操作
+        # Note: 'feeds' is a list materialized from an iterator, so it's safe to iterate again.
         for feed in feeds:
             try:
                 cache_rss(feed.slug, feed_type="o", format="xml")
@@ -160,14 +183,17 @@ def update_feeds_for_frequency(simple_update_frequency: str):
 
     try:
         frequency_val = update_frequency_map[simple_update_frequency]
-        feeds = list(Feed.objects.filter(update_frequency=frequency_val))
-        log = f"{current_time}: Start update feeds for frequency: {simple_update_frequency}, feeds count: {len(feeds)}"
+        # Use iterator to reduce initial memory load, then convert to list for multiple uses.
+        feeds_iterator = Feed.objects.filter(update_frequency=frequency_val).iterator()
+        feeds_list = list(feeds_iterator)
+        
+        log = f"{current_time}: Start update feeds for frequency: {simple_update_frequency}, feeds count: {len(feeds_list)}"
         logging.info(log)
         # output to stdout
         print(log)
-        update_multiple_feeds(feeds) if feeds else logging.info(
-            "No feeds to update for this frequency."
-        )
+        
+        update_multiple_feeds(feeds_list)
+
     except KeyError:
         logging.error(f"Invalid frequency: {simple_update_frequency}")
     except Exception as e:
