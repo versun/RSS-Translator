@@ -47,8 +47,19 @@ def handle_single_feed_fetch(feed: Feed):
             existing_entries = dict(
                 Entry.objects.filter(feed=feed).values_list("guid", "id")
             )
+            
+            # Sort entries by publication date (newest first)
+            sorted_entries = sorted(
+                latest_feed.entries,
+                key=lambda x: (
+                    x.get("published_parsed") or 
+                    x.get("updated_parsed") or 
+                    time.gmtime(0)  # Fallback to epoch if no date
+                ),
+                reverse=True
+            )[: feed.max_posts]
 
-            for i, entry_data in enumerate(latest_feed.entries[: feed.max_posts]):
+            for i, entry_data in enumerate(sorted_entries):
                 # Get content
                 content = ""
                 if "content" in entry_data:
@@ -108,6 +119,8 @@ def handle_single_feed_fetch(feed: Feed):
         # Explicitly clean up large objects
         if 'latest_feed' in locals():
             del latest_feed
+        if 'sorted_entries' in locals():
+            del sorted_entries
         if 'fetch_results' in locals():
             del fetch_results
 
@@ -196,7 +209,7 @@ def handle_feeds_summary(feeds: list):
 def translate_feed(feed: Feed, target_field: str = "title"):
     """Translate and summarize feed entries with memory optimizations."""
     logging.info(
-        "Translating feed: %s (%s items)", feed.target_language, feed.entries.count()
+        "Translating feed: %s", feed.target_language
     )
     total_tokens = 0
     total_characters = 0
@@ -204,7 +217,7 @@ def translate_feed(feed: Feed, target_field: str = "title"):
     BATCH_SIZE = 30  # Reduced batch size for memory efficiency
 
     # 只处理前 feed.max_posts 条 entries
-    entries = feed.entries.all()[: feed.max_posts].iterator(chunk_size=50)
+    entries = feed.entries.order_by("-pubdate")[: feed.max_posts].iterator(chunk_size=50)
     
     for entry in entries:
         try:
@@ -402,9 +415,19 @@ def summarize_feed(
 
     try:
         # 只处理前 feed.max_posts 条 entries
-        entries = feed.entries.select_related('feed').filter(ai_summary__isnull=True)[: feed.max_posts].iterator(chunk_size=30)
-        total_entries = feed.entries.filter(ai_summary__isnull=True)[: feed.max_posts].count()
-        
+        entries = (
+            feed.entries
+            .select_related('feed')
+            .filter(ai_summary__isnull=True)
+            .order_by('-pubdate')[: feed.max_posts]
+            .iterator(chunk_size=30)
+        )
+        total_entries = (
+            feed.entries
+            .filter(ai_summary__isnull=True)
+            .order_by('-pubdate')[: feed.max_posts]
+            .count()
+        )
         if not total_entries:
             logging.info(f"No entries to summarize for feed: {feed.feed_url}")
             return
